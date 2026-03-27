@@ -1,91 +1,296 @@
 # Distributed Order Processing & Inventory Management System
 
-A microservices-based backend system that simulates order creation, inventory reservation, payment authorization, shipment creation, and asynchronous workflow progression using a PostgreSQL-backed transactional outbox pattern.
+A Python microservices project that models order intake, inventory reservation, payment authorization, and shipment creation using FastAPI, PostgreSQL, and a shared transactional outbox table.
 
-## Features
+This repository is intentionally small enough to review in an interview, but it still demonstrates idempotent writes, asynchronous workflow progression, shared state tracking, containerized local startup, end-to-end tests, and CI automation.
 
-- Microservices-based design with clear service boundaries
-- Idempotent order creation using `Idempotency-Key`
-- PostgreSQL-backed persistence
-- Transactional outbox pattern for reliable event creation
-- Workflow state tracking across services
-- Automated dispatcher/poller service for event progression
-- Docker Compose support for full local startup
-- End-to-end tests for happy path and failure scenarios
+Related documentation:
+- [Architecture Notes](docs/architecture.md)
+- [Workflow Diagrams](docs/workflow-diagrams.md)
+- [GitHub Actions CI Workflow](.github/workflows/ci.yml)
 
-## Tech Stack
+## Project Overview
 
-- Python
-- FastAPI
-- PostgreSQL
-- Docker / Docker Compose
-- Pytest
-- HTTPX
+The system is composed of five services:
 
-## Services
+- `order-service` accepts orders and creates the initial workflow state.
+- `inventory-service` consumes `order.created` events and reserves stock.
+- `payment-service` consumes `inventory.reserved` events and simulates payment authorization.
+- `shipment-service` consumes `payment.authorized` events and creates shipments.
+- `dispatcher-service` polls each downstream service's `/events/process` endpoint so the workflow advances automatically.
 
-- **order-service**
-  - Accepts orders
-  - Stores orders in PostgreSQL
-  - Creates workflow state
-  - Publishes `order.created` outbox events
+For local-demo simplicity, all services share one PostgreSQL database. The database stores the business tables, the `workflow_state` read model, and a shared `outbox_events` table.
 
-- **inventory-service**
-  - Consumes `order.created`
-  - Reserves stock or rejects the order if stock is insufficient
-  - Publishes `inventory.reserved` or `inventory.failed`
+## Current Features
 
-- **payment-service**
-  - Consumes `inventory.reserved`
-  - Simulates payment authorization
-  - Publishes `payment.authorized` or `payment.failed`
+- FastAPI-based Python microservices with clear workflow ownership
+- Shared PostgreSQL persistence for orders, workflow state, outbox events, inventory, payments, and shipments
+- Idempotent order creation via the `Idempotency-Key` header
+- Transactional creation of `orders`, `workflow_state`, and `order.created` in one database transaction
+- Seeded inventory data for three demo SKUs
+- Background dispatcher polling every 5 seconds by default
+- Happy-path, inventory-failure, and payment-failure end-to-end tests
+- GitHub Actions CI that boots the stack with Docker Compose and runs the test suite
 
-- **shipment-service**
-  - Consumes `payment.authorized`
-  - Creates shipment records
-  - Publishes `shipment.created`
+## High-Level Architecture
 
-- **dispatcher-service**
-  - Polls downstream service event-processing endpoints automatically
-  - Advances the workflow without manual triggering
+```mermaid
+flowchart LR
+    Client["Client or test runner"]
+    Order["order-service<br/>:8001"]
+    Inventory["inventory-service<br/>:8002"]
+    Payment["payment-service<br/>:8003"]
+    Shipment["shipment-service<br/>:8004"]
+    Dispatcher["dispatcher-service<br/>:8005"]
+    DB["PostgreSQL<br/>orders<br/>workflow_state<br/>outbox_events<br/>inventory_stock<br/>inventory_reservations<br/>payments<br/>shipments"]
 
-## Workflow
+    Client -->|"POST /orders"| Order
+    Order -->|"insert order + workflow_state + order.created"| DB
 
-Happy path:
+    Dispatcher -.->|"POST /events/process"| Inventory
+    Dispatcher -.->|"POST /events/process"| Payment
+    Dispatcher -.->|"POST /events/process"| Shipment
 
-1. Client creates order
-2. `order-service` saves order and emits `order.created`
-3. `inventory-service` reserves stock and emits `inventory.reserved`
-4. `payment-service` authorizes payment and emits `payment.authorized`
-5. `shipment-service` creates shipment and emits `shipment.created`
-6. Workflow state becomes completed
+    Inventory -->|"read/write stock and reservations"| DB
+    Payment -->|"read orders, write payments"| DB
+    Shipment -->|"write shipments"| DB
+```
 
-Failure paths supported:
+## Services And Responsibilities
 
-- Inventory failure when stock is insufficient
-- Payment failure when amount is greater than the configured demo threshold
+| Service | Port | Responsibility | Key Endpoints | API Docs |
+| --- | --- | --- | --- | --- |
+| `order-service` | `8001` | Accepts orders, enforces idempotency, initializes `workflow_state`, and writes `order.created` to `outbox_events` | `POST /orders`, `GET /orders/{order_id}`, `GET /workflows/{order_id}`, `GET /outbox/pending`, `GET /health` | [http://127.0.0.1:8001/docs](http://127.0.0.1:8001/docs) |
+| `inventory-service` | `8002` | Seeds demo stock, consumes `order.created`, creates inventory reservations, and emits `inventory.reserved` or `inventory.failed` | `GET /inventory/{sku}`, `GET /reservations/{order_id}`, `POST /events/process`, `GET /health` | [http://127.0.0.1:8002/docs](http://127.0.0.1:8002/docs) |
+| `payment-service` | `8003` | Consumes `inventory.reserved`, creates payment records, and emits `payment.authorized` or `payment.failed` | `GET /payments/{order_id}`, `POST /events/process`, `GET /health` | [http://127.0.0.1:8003/docs](http://127.0.0.1:8003/docs) |
+| `shipment-service` | `8004` | Consumes `payment.authorized`, creates shipment records, and emits `shipment.created` | `GET /shipments/{order_id}`, `POST /events/process`, `GET /health` | [http://127.0.0.1:8004/docs](http://127.0.0.1:8004/docs) |
+| `dispatcher-service` | `8005` | Runs a background loop that calls the downstream `/events/process` endpoints and also exposes a manual run-once endpoint | `POST /dispatch/run-once`, `GET /health` | [http://127.0.0.1:8005/docs](http://127.0.0.1:8005/docs) |
 
-## Architecture Notes
+## Event Workflow
 
-This project uses a simplified **transactional outbox pattern**:
-- business state and event records are written in the same database transaction
-- downstream services process pending events
-- workflow progress is stored in a shared `workflow_state` table for visibility
+1. A client sends `POST /orders` to `order-service` with an `Idempotency-Key` header.
+2. `order-service` inserts the order, initializes `workflow_state` with `ORDER_CREATED`, and writes `order.created` to `outbox_events` in the same transaction.
+3. `dispatcher-service` calls `inventory-service` at `POST /events/process`.
+4. `inventory-service` consumes pending `order.created` events.
+   - If stock is available, it creates a reservation, sets `current_step` to `INVENTORY_RESERVED`, and emits `inventory.reserved`.
+   - If stock is unavailable, it creates a failed reservation, sets `current_step` to `INVENTORY_REJECTED`, sets `order_status` to `FAILED`, and emits `inventory.failed`.
+5. `dispatcher-service` calls `payment-service` at `POST /events/process`.
+6. `payment-service` consumes pending `inventory.reserved` events.
+   - If `amount <= 500`, it creates an authorized payment, sets `current_step` to `PAYMENT_AUTHORIZED`, and emits `payment.authorized`.
+   - If `amount > 500`, it creates a failed payment, sets `current_step` to `PAYMENT_FAILED`, sets `order_status` to `FAILED`, and emits `payment.failed`.
+7. `dispatcher-service` calls `shipment-service` at `POST /events/process`.
+8. `shipment-service` consumes pending `payment.authorized` events, creates a shipment, sets `current_step` to `SHIPMENT_CREATED`, sets `order_status` to `COMPLETED`, and emits `shipment.created`.
+9. In the current implementation, no downstream service consumes `inventory.failed`, `payment.failed`, or `shipment.created`, so those terminal events remain visible in `GET /outbox/pending`.
 
-For local demo simplicity, services share one PostgreSQL database.
-In a production-grade version, this could evolve into separate databases plus a broker such as Kafka or RabbitMQ.
+## Event Sequence Diagram
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Order as "order-service"
+    participant DB as "PostgreSQL / outbox_events"
+    participant Dispatcher as "dispatcher-service"
+    participant Inventory as "inventory-service"
+    participant Payment as "payment-service"
+    participant Shipment as "shipment-service"
+
+    Client->>Order: POST /orders + Idempotency-Key
+    Order->>DB: Insert order, workflow_state, order.created
+
+    loop Every poll interval
+        Dispatcher->>Inventory: POST /events/process
+        Inventory->>DB: Read pending order.created
+        alt Stock available
+            Inventory->>DB: Reserve stock, set INVENTORY_RESERVED, insert inventory.reserved
+            Dispatcher->>Payment: POST /events/process
+            Payment->>DB: Read pending inventory.reserved
+            alt Amount <= 500
+                Payment->>DB: Insert payment, set PAYMENT_AUTHORIZED, insert payment.authorized
+                Dispatcher->>Shipment: POST /events/process
+                Shipment->>DB: Read pending payment.authorized
+                Shipment->>DB: Insert shipment, set SHIPMENT_CREATED, insert shipment.created
+            else Amount > 500
+                Payment->>DB: Insert failed payment, set PAYMENT_FAILED, insert payment.failed
+            end
+        else Stock unavailable
+            Inventory->>DB: Insert failed reservation, set INVENTORY_REJECTED, insert inventory.failed
+        end
+    end
+```
 
 ## Project Structure
 
 ```text
 .
-├── docker-compose.yml
-├── requirements-test.txt
-├── docs/
-├── services/
-│   ├── order-service/
-│   ├── inventory-service/
-│   ├── payment-service/
-│   ├── shipment-service/
-│   └── dispatcher-service/
-└── tests/
+|- README.md
+|- docker-compose.yml
+|- requirements-test.txt
+|- docs/
+|  |- architecture.md
+|  `- workflow-diagrams.md
+|- services/
+|  |- dispatcher-service/
+|  |- inventory-service/
+|  |- order-service/
+|  |- payment-service/
+|  `- shipment-service/
+|- shared/
+|  `- models/
+|- tests/
+|  `- test_e2e_workflow.py
+`- .github/
+   `- workflows/
+      `- ci.yml
+```
+
+## Local Startup With Docker Compose
+
+Prerequisites:
+
+- Docker Engine or Docker Desktop
+- Docker Compose v2
+- Python 3.11 if you want to run the test suite locally
+
+Start the full stack:
+
+```bash
+docker compose up --build -d
+```
+
+Check the running containers:
+
+```bash
+docker compose ps
+```
+
+Optional health checks:
+
+```bash
+curl http://127.0.0.1:8001/health
+curl http://127.0.0.1:8002/health
+curl http://127.0.0.1:8003/health
+curl http://127.0.0.1:8004/health
+curl http://127.0.0.1:8005/health
+```
+
+Useful runtime notes:
+
+- `order-service` creates the shared `orders`, `workflow_state`, and `outbox_events` tables on startup.
+- `inventory-service` creates `inventory_stock` and `inventory_reservations`, then seeds `SKU-CHAIR-01`, `SKU-TABLE-01`, and `SKU-LAMP-01`.
+- `payment-service` creates the `payments` table.
+- `shipment-service` creates the `shipments` table.
+- `dispatcher-service` starts polling automatically after startup.
+
+Stop and remove the stack:
+
+```bash
+docker compose down -v
+```
+
+## API Docs URLs
+
+Once the stack is running, FastAPI serves interactive docs at:
+
+- `order-service`: [http://127.0.0.1:8001/docs](http://127.0.0.1:8001/docs)
+- `inventory-service`: [http://127.0.0.1:8002/docs](http://127.0.0.1:8002/docs)
+- `payment-service`: [http://127.0.0.1:8003/docs](http://127.0.0.1:8003/docs)
+- `shipment-service`: [http://127.0.0.1:8004/docs](http://127.0.0.1:8004/docs)
+- `dispatcher-service`: [http://127.0.0.1:8005/docs](http://127.0.0.1:8005/docs)
+
+## Example curl Commands
+
+Create an order:
+
+```bash
+curl -X POST http://127.0.0.1:8001/orders \
+  -H "Idempotency-Key: demo-order-001" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "customer_id": "cust-001",
+    "sku": "SKU-LAMP-01",
+    "quantity": 2,
+    "amount": 120.00,
+    "currency": "usd"
+  }'
+```
+
+Fetch workflow state for a specific order:
+
+```bash
+curl http://127.0.0.1:8001/workflows/<order_id>
+```
+
+Inspect seeded inventory for a SKU:
+
+```bash
+curl http://127.0.0.1:8002/inventory/SKU-LAMP-01
+```
+
+Manually trigger one dispatcher pass:
+
+```bash
+curl -X POST http://127.0.0.1:8005/dispatch/run-once
+```
+
+Inspect downstream records:
+
+```bash
+curl http://127.0.0.1:8003/payments/<order_id>
+curl http://127.0.0.1:8004/shipments/<order_id>
+```
+
+Inspect pending outbox events:
+
+```bash
+curl http://127.0.0.1:8001/outbox/pending
+```
+
+## Running Tests
+
+The end-to-end tests expect the full Docker Compose stack to be running locally, including `dispatcher-service`.
+
+Install the test dependencies:
+
+```bash
+python -m pip install --upgrade pip
+pip install -r requirements-test.txt
+```
+
+Run the test suite:
+
+```bash
+pytest tests -v
+```
+
+Current test coverage in `tests/test_e2e_workflow.py` includes:
+
+- Happy path from order creation to shipment creation
+- Inventory failure when requested quantity exceeds available stock
+- Payment failure when `amount > 500`
+
+## Continuous Integration
+
+GitHub Actions is already configured in [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
+
+The workflow currently:
+
+- Runs on pushes to `main`
+- Runs on pull requests targeting `main`
+- Starts the stack with `docker compose up --build -d`
+- Waits for the services to come up
+- Installs `requirements-test.txt`
+- Executes `pytest tests -v`
+- Prints container logs on failure
+- Shuts the stack down with `docker compose down -v`
+
+## Resume And Interview Value
+
+This repository is a strong interview discussion piece because it shows:
+
+- Service boundaries around a business workflow instead of a single CRUD API
+- Idempotent write handling with an explicit request header
+- A transactional outbox pattern backed by SQL rather than an in-memory queue
+- Workflow-state tracking that lets you inspect process progression by order ID
+- Containerized local setup plus end-to-end tests and CI
+
+For deeper implementation notes, see [Architecture Notes](docs/architecture.md) and [Workflow Diagrams](docs/workflow-diagrams.md).

@@ -20,8 +20,48 @@ jobs:
       - name: Start services
         run: docker compose up --build -d
 
-      - name: Wait for services to start
-        run: sleep 20
+      - name: Wait for services to become healthy
+        run: |
+          set -euo pipefail
+          containers=(
+            order-db
+            order-service
+            inventory-service
+            payment-service
+            shipment-service
+            dispatcher-service
+          )
+
+          for container in "${containers[@]}"; do
+            echo "Waiting for ${container}..."
+
+            for attempt in {1..60}; do
+              status=$(docker inspect --format='{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "${container}")
+
+              if [ "${status}" = "healthy" ]; then
+                echo "${container} is healthy"
+                break
+              fi
+
+              if [ "${status}" = "exited" ] || [ "${status}" = "dead" ]; then
+                echo "${container} is ${status}"
+                docker logs "${container}"
+                exit 1
+              fi
+
+              sleep 2
+            done
+
+            final_status=$(docker inspect --format='{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "${container}")
+            if [ "${final_status}" != "healthy" ]; then
+              echo "${container} did not become healthy"
+              docker logs "${container}"
+              exit 1
+            fi
+          done
+
+      - name: Show container status
+        run: docker compose ps
 
       - name: Set up Python
         uses: actions/setup-python@v5
