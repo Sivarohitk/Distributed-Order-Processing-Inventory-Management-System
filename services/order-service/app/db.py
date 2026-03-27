@@ -27,4 +27,35 @@ def init_db():
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS workflow_state (
+                    order_id TEXT PRIMARY KEY REFERENCES orders(order_id) ON DELETE CASCADE,
+                    current_step TEXT NOT NULL,
+                    order_status TEXT NOT NULL,
+                    inventory_status TEXT NOT NULL,
+                    payment_status TEXT NOT NULL,
+                    shipment_status TEXT NOT NULL,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS outbox_events (
+                    event_id TEXT PRIMARY KEY,
+                    aggregate_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    payload JSONB NOT NULL,
+                    status TEXT NOT NULL,
+                    retry_count INTEGER NOT NULL DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    published_at TIMESTAMP NULL
+                )
+            """)
+
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_outbox_events_status_created_at
+                ON outbox_events (status, created_at)
+            """)
+
         conn.commit()

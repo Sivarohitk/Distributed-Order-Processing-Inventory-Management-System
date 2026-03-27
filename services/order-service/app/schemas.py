@@ -1,5 +1,6 @@
+from datetime import datetime
+from typing import Any
 from pydantic import BaseModel, Field
-from typing import Literal
 
 
 class OrderCreate(BaseModel):
@@ -17,5 +18,23 @@ class OrderResponse(BaseModel):
     quantity: int
     amount: float
     currency: str
-    status: Literal["PENDING"]
+    status: str
     message: str
+
+
+class WorkflowStateResponse(BaseModel):
+    order_id: str
+    current_step: str
+    order_status: str
+    inventory_status: str
+    payment_status: str
+    shipment_status: str
+
+
+class OutboxEventResponse(BaseModel):
+    event_id: str
+    aggregate_id: str
+    event_type: str
+    payload: dict[str, Any]
+    status: str
+    created_at: datetime

@@ -1,3 +1,4 @@
+import json
 import logging
 from uuid import uuid4
 
@@ -5,9 +6,14 @@ from fastapi import FastAPI, Header, HTTPException
 from psycopg.rows import dict_row
 
 from .db import get_connection, init_db
-from .schemas import OrderCreate, OrderResponse
+from .schemas import (
+    OrderCreate,
+    OrderResponse,
+    WorkflowStateResponse,
+    OutboxEventResponse,
+)
 
-app = FastAPI(title="Order Service", version="0.2.0")
+app = FastAPI(title="Order Service", version="0.3.0")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -26,6 +32,7 @@ def health():
             with conn.cursor() as cur:
                 cur.execute("SELECT 1")
                 cur.fetchone()
+
         return {
             "status": "ok",
             "service": "order-service",
@@ -47,10 +54,38 @@ def create_order(
             detail="Idempotency-Key header is required"
         )
 
-    new_order_id = str(uuid4())
-
     with get_connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("""
+                SELECT order_id, customer_id, sku, quantity, amount, currency, status
+                FROM orders
+                WHERE idempotency_key = %s
+            """, (idempotency_key,))
+            existing_order = cur.fetchone()
+
+            if existing_order:
+                logger.info(
+                    "Duplicate request received for idempotency key %s",
+                    idempotency_key
+                )
+                return {
+                    **existing_order,
+                    "message": "Order already exists for this idempotency key"
+                }
+
+            order_id = str(uuid4())
+            event_id = str(uuid4())
+
+            order = {
+                "order_id": order_id,
+                "customer_id": payload.customer_id,
+                "sku": payload.sku,
+                "quantity": payload.quantity,
+                "amount": payload.amount,
+                "currency": payload.currency.upper(),
+                "status": "PENDING",
+            }
+
             cur.execute("""
                 INSERT INTO orders (
                     order_id,
@@ -63,28 +98,70 @@ def create_order(
                     status
                 )
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (idempotency_key)
-                DO UPDATE SET idempotency_key = EXCLUDED.idempotency_key
-                RETURNING order_id, customer_id, sku, quantity, amount, currency, status
             """, (
-                new_order_id,
+                order["order_id"],
                 idempotency_key,
-                payload.customer_id,
-                payload.sku,
-                payload.quantity,
-                payload.amount,
-                payload.currency.upper(),
-                "PENDING"
+                order["customer_id"],
+                order["sku"],
+                order["quantity"],
+                order["amount"],
+                order["currency"],
+                order["status"],
             ))
 
-            order = cur.fetchone()
+            cur.execute("""
+                INSERT INTO workflow_state (
+                    order_id,
+                    current_step,
+                    order_status,
+                    inventory_status,
+                    payment_status,
+                    shipment_status
+                )
+                VALUES (%s, %s, %s, %s, %s, %s)
+            """, (
+                order_id,
+                "ORDER_CREATED",
+                "PENDING",
+                "NOT_STARTED",
+                "NOT_STARTED",
+                "NOT_STARTED",
+            ))
+
+            event_payload = {
+                "order_id": order_id,
+                "customer_id": payload.customer_id,
+                "sku": payload.sku,
+                "quantity": payload.quantity,
+                "amount": payload.amount,
+                "currency": payload.currency.upper(),
+                "idempotency_key": idempotency_key,
+            }
+
+            cur.execute("""
+                INSERT INTO outbox_events (
+                    event_id,
+                    aggregate_id,
+                    event_type,
+                    payload,
+                    status
+                )
+                VALUES (%s, %s, %s, %s::jsonb, %s)
+            """, (
+                event_id,
+                order_id,
+                "order.created",
+                json.dumps(event_payload),
+                "PENDING",
+            ))
+
         conn.commit()
 
-    logger.info("Stored order %s", order["order_id"])
+    logger.info("Stored order %s and queued outbox event", order_id)
 
     return {
         **order,
-        "message": "Order stored successfully"
+        "message": "Order stored and outbox event queued successfully"
     }
 
 
@@ -106,3 +183,47 @@ def get_order(order_id: str):
         **order,
         "message": "Order fetched successfully"
     }
+
+
+@app.get("/workflows/{order_id}", response_model=WorkflowStateResponse)
+def get_workflow(order_id: str):
+    with get_connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("""
+                SELECT
+                    order_id,
+                    current_step,
+                    order_status,
+                    inventory_status,
+                    payment_status,
+                    shipment_status
+                FROM workflow_state
+                WHERE order_id = %s
+            """, (order_id,))
+            workflow = cur.fetchone()
+
+    if not workflow:
+        raise HTTPException(status_code=404, detail="Workflow state not found")
+
+    return workflow
+
+
+@app.get("/outbox/pending", response_model=list[OutboxEventResponse])
+def get_pending_outbox_events():
+    with get_connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("""
+                SELECT
+                    event_id,
+                    aggregate_id,
+                    event_type,
+                    payload,
+                    status,
+                    created_at
+                FROM outbox_events
+                WHERE status = 'PENDING'
+                ORDER BY created_at ASC
+            """)
+            events = cur.fetchall()
+
+    return events
