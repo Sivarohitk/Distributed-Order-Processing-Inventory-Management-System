@@ -13,5 +13,61 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
 
+  order-service:
+    build: ./services/order-service
+    container_name: order-service
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/order_db
+    depends_on:
+      - postgres
+    ports:
+      - "8001:8001"
+
+  inventory-service:
+    build: ./services/inventory-service
+    container_name: inventory-service
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/order_db
+    depends_on:
+      - postgres
+    ports:
+      - "8002:8002"
+
+  payment-service:
+    build: ./services/payment-service
+    container_name: payment-service
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/order_db
+    depends_on:
+      - postgres
+    ports:
+      - "8003:8003"
+
+  shipment-service:
+    build: ./services/shipment-service
+    container_name: shipment-service
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/order_db
+    depends_on:
+      - postgres
+    ports:
+      - "8004:8004"
+
+  dispatcher-service:
+    build: ./services/dispatcher-service
+    container_name: dispatcher-service
+    environment:
+      INVENTORY_SERVICE_URL: http://inventory-service:8002
+      PAYMENT_SERVICE_URL: http://payment-service:8003
+      SHIPMENT_SERVICE_URL: http://shipment-service:8004
+      POLL_INTERVAL_SECONDS: 5
+      BATCH_SIZE: 10
+    depends_on:
+      - inventory-service
+      - payment-service
+      - shipment-service
+    ports:
+      - "8005:8005"
+
 volumes:
   postgres_data:
