@@ -21,7 +21,7 @@ flowchart LR
 
     Dispatcher -.->|"POST /events/process"| Inventory
     DB -->|"pending order.created"| Inventory
-    Inventory -->|"update stock/reservation + insert inventory.reserved or inventory.failed"| DB
+    Inventory -->|"update stock/reservation + insert inventory.reserved (with amount/currency) or inventory.failed"| DB
 
     Dispatcher -.->|"POST /events/process"| Payment
     DB -->|"pending inventory.reserved"| Payment
@@ -35,7 +35,7 @@ flowchart LR
 Notes:
 
 - `dispatcher-service` automates progression by calling the downstream processing endpoints on a loop.
-- `inventory.failed`, `payment.failed`, and `shipment.created` are emitted in the current implementation, but no downstream service consumes them.
+- `inventory.failed`, `payment.failed`, and `shipment.created` are still emitted in the current implementation, but they are stored as already handled audit events instead of being left pending.
 
 ## Workflow State Progression Diagram
 
@@ -107,4 +107,4 @@ stateDiagram-v2
     SHIPMENT_CREATED --> [*]
 ```
 
-This state diagram reflects the values stored in the `workflow_state` table today. The `orders.status` column is separate from `workflow_state.order_status`, so order-level reads and workflow reads are not the same view of status.
+This state diagram reflects the values stored in the `workflow_state` table today. The `orders.status` column now mirrors the terminal lifecycle outcome: it stays `PENDING` while work is in flight, then becomes `FAILED` or `COMPLETED` when the workflow reaches a terminal state.

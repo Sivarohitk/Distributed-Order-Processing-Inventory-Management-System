@@ -14,14 +14,28 @@ from .schemas import (
 
 app = FastAPI(title="Payment Service", version="0.1.0")
 
+SERVICE_NAME = "payment-service"
+
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger(SERVICE_NAME)
+
+
+def log_structured(action: str, level: int = logging.INFO, **fields):
+    payload = {"service": SERVICE_NAME, "action": action}
+    payload.update({key: value for key, value in fields.items() if value is not None})
+    logger.log(level, json.dumps(payload, sort_keys=True, default=str))
+
+
+def log_exception(action: str, **fields):
+    payload = {"service": SERVICE_NAME, "action": action}
+    payload.update({key: value for key, value in fields.items() if value is not None})
+    logger.exception(json.dumps(payload, sort_keys=True, default=str))
 
 
 @app.on_event("startup")
 def startup_event():
     init_db()
-    logger.info("Payment database initialized")
+    log_structured("startup_complete", status="ready")
 
 
 @app.get("/health")
@@ -32,13 +46,9 @@ def health():
                 cur.execute("SELECT 1")
                 cur.fetchone()
 
-        return {
-            "status": "ok",
-            "service": "payment-service",
-            "database": "connected"
-        }
+        return {"status": "ok", "service": SERVICE_NAME, "database": "connected"}
     except Exception:
-        logger.exception("Payment health check failed")
+        log_exception("health_check_failed", status="unavailable")
         raise HTTPException(status_code=503, detail="Database unavailable")
 
 
@@ -46,11 +56,14 @@ def health():
 def get_payment(order_id: str):
     with get_connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute("""
+            cur.execute(
+                """
                 SELECT payment_id, order_id, amount, currency, status
                 FROM payments
                 WHERE order_id = %s
-            """, (order_id,))
+            """,
+                (order_id,),
+            )
             payment = cur.fetchone()
 
     if not payment:
@@ -60,14 +73,14 @@ def get_payment(order_id: str):
 
 
 @app.post("/events/process", response_model=ProcessPaymentEventsResponse)
-def process_inventory_reserved_events(
-    batch_size: int = Query(default=10, ge=1, le=100)
-):
+def process_inventory_reserved_events(batch_size: int = Query(default=10, ge=1, le=100)):
     results: list[ProcessedPaymentEventResult] = []
+    log_entries = []
 
     with get_connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute("""
+            cur.execute(
+                """
                 SELECT event_id, aggregate_id, payload
                 FROM outbox_events
                 WHERE status = 'PENDING'
@@ -75,7 +88,9 @@ def process_inventory_reserved_events(
                 ORDER BY created_at ASC
                 FOR UPDATE SKIP LOCKED
                 LIMIT %s
-            """, (batch_size,))
+            """,
+                (batch_size,),
+            )
             events = cur.fetchall()
 
             for event in events:
@@ -83,58 +98,83 @@ def process_inventory_reserved_events(
                 order_id = event["aggregate_id"]
                 payload = event["payload"]
 
-                cur.execute("""
+                cur.execute(
+                    """
                     SELECT payment_id, order_id, amount, currency, status
                     FROM payments
                     WHERE order_id = %s
-                """, (order_id,))
+                """,
+                    (order_id,),
+                )
                 existing_payment = cur.fetchone()
 
                 if existing_payment:
-                    cur.execute("""
+                    cur.execute(
+                        """
                         UPDATE outbox_events
                         SET status = 'PROCESSED',
                             published_at = CURRENT_TIMESTAMP
                         WHERE event_id = %s
-                    """, (event_id,))
+                    """,
+                        (event_id,),
+                    )
 
                     results.append(
                         ProcessedPaymentEventResult(
-                            event_id=event_id,
-                            order_id=order_id,
-                            result="ALREADY_PROCESSED"
+                            event_id=event_id, order_id=order_id, result="ALREADY_PROCESSED"
                         )
+                    )
+
+                    log_entries.append(
+                        {
+                            "action": "inventory_reserved_processed",
+                            "event_type": "inventory.reserved",
+                            "order_id": order_id,
+                            "status": existing_payment["status"],
+                            "result": "already_processed",
+                        }
                     )
                     continue
 
-                cur.execute("""
-                    SELECT amount, currency
-                    FROM orders
-                    WHERE order_id = %s
-                """, (order_id,))
-                order_row = cur.fetchone()
+                amount = payload.get("amount")
+                currency = payload.get("currency")
 
-                if not order_row:
-                    cur.execute("""
+                try:
+                    amount = float(amount)
+                except (TypeError, ValueError):
+                    amount = None
+
+                if amount is None or not currency:
+                    cur.execute(
+                        """
                         UPDATE outbox_events
                         SET status = 'FAILED',
                             retry_count = retry_count + 1
                         WHERE event_id = %s
-                    """, (event_id,))
+                    """,
+                        (event_id,),
+                    )
 
                     results.append(
                         ProcessedPaymentEventResult(
-                            event_id=event_id,
-                            order_id=order_id,
-                            result="ORDER_NOT_FOUND"
+                            event_id=event_id, order_id=order_id, result="INVALID_EVENT_PAYLOAD"
                         )
+                    )
+
+                    log_entries.append(
+                        {
+                            "action": "inventory_reserved_processed",
+                            "event_type": "inventory.reserved",
+                            "order_id": order_id,
+                            "status": "FAILED",
+                            "result": "invalid_event_payload",
+                        }
                     )
                     continue
 
                 payment_id = str(uuid4())
                 next_event_id = str(uuid4())
-                amount = order_row["amount"]
-                currency = order_row["currency"]
+                currency = str(currency).upper()
 
                 # Simple demo rule:
                 # payments <= 500 succeed, > 500 fail
@@ -143,37 +183,44 @@ def process_inventory_reserved_events(
                     next_event_type = "payment.authorized"
                     workflow_step = "PAYMENT_AUTHORIZED"
 
-                    cur.execute("""
+                    cur.execute(
+                        """
                         UPDATE workflow_state
                         SET current_step = %s,
                             payment_status = %s,
                             updated_at = CURRENT_TIMESTAMP
                         WHERE order_id = %s
-                    """, (
-                        workflow_step,
-                        payment_status,
-                        order_id
-                    ))
+                    """,
+                        (workflow_step, payment_status, order_id),
+                    )
                 else:
                     payment_status = "FAILED"
                     next_event_type = "payment.failed"
                     workflow_step = "PAYMENT_FAILED"
 
-                    cur.execute("""
+                    cur.execute(
+                        """
+                        UPDATE orders
+                        SET status = %s
+                        WHERE order_id = %s
+                    """,
+                        ("FAILED", order_id),
+                    )
+
+                    cur.execute(
+                        """
                         UPDATE workflow_state
                         SET current_step = %s,
                             order_status = %s,
                             payment_status = %s,
                             updated_at = CURRENT_TIMESTAMP
                         WHERE order_id = %s
-                    """, (
-                        workflow_step,
-                        "FAILED",
-                        payment_status,
-                        order_id
-                    ))
+                    """,
+                        (workflow_step, "FAILED", payment_status, order_id),
+                    )
 
-                cur.execute("""
+                cur.execute(
+                    """
                     INSERT INTO payments (
                         payment_id,
                         order_id,
@@ -182,58 +229,99 @@ def process_inventory_reserved_events(
                         status
                     )
                     VALUES (%s, %s, %s, %s, %s)
-                """, (
-                    payment_id,
-                    order_id,
-                    amount,
-                    currency,
-                    payment_status
-                ))
+                """,
+                    (payment_id, order_id, amount, currency, payment_status),
+                )
 
                 next_payload = {
                     "order_id": order_id,
                     "payment_status": payment_status,
-                    "amount": float(amount),
-                    "currency": currency
+                    "amount": amount,
+                    "currency": currency,
                 }
 
-                cur.execute("""
-                    INSERT INTO outbox_events (
-                        event_id,
-                        aggregate_id,
-                        event_type,
-                        payload,
-                        status
+                if next_event_type == "payment.failed":
+                    cur.execute(
+                        """
+                        INSERT INTO outbox_events (
+                            event_id,
+                            aggregate_id,
+                            event_type,
+                            payload,
+                            status,
+                            published_at
+                        )
+                        VALUES (%s, %s, %s, %s::jsonb, %s, CURRENT_TIMESTAMP)
+                    """,
+                        (
+                            next_event_id,
+                            order_id,
+                            next_event_type,
+                            json.dumps(next_payload),
+                            "PROCESSED",
+                        ),
                     )
-                    VALUES (%s, %s, %s, %s::jsonb, %s)
-                """, (
-                    next_event_id,
-                    order_id,
-                    next_event_type,
-                    json.dumps(next_payload),
-                    "PENDING"
-                ))
+                else:
+                    cur.execute(
+                        """
+                        INSERT INTO outbox_events (
+                            event_id,
+                            aggregate_id,
+                            event_type,
+                            payload,
+                            status
+                        )
+                        VALUES (%s, %s, %s, %s::jsonb, %s)
+                    """,
+                        (
+                            next_event_id,
+                            order_id,
+                            next_event_type,
+                            json.dumps(next_payload),
+                            "PENDING",
+                        ),
+                    )
 
-                cur.execute("""
+                cur.execute(
+                    """
                     UPDATE outbox_events
                     SET status = 'PROCESSED',
                         published_at = CURRENT_TIMESTAMP
                     WHERE event_id = %s
-                """, (event_id,))
+                """,
+                    (event_id,),
+                )
 
                 results.append(
                     ProcessedPaymentEventResult(
-                        event_id=event_id,
-                        order_id=order_id,
-                        result=payment_status
+                        event_id=event_id, order_id=order_id, result=payment_status
                     )
+                )
+
+                log_entries.append(
+                    {
+                        "action": "payment_authorized"
+                        if payment_status == "AUTHORIZED"
+                        else "payment_failed",
+                        "event_type": "inventory.reserved",
+                        "next_event_type": next_event_type,
+                        "order_id": order_id,
+                        "status": payment_status,
+                        "result": payment_status.lower(),
+                    }
                 )
 
         conn.commit()
 
-    logger.info("Processed %s inventory.reserved events", len(results))
+    for entry in log_entries:
+        log_structured(**entry)
 
-    return ProcessPaymentEventsResponse(
+    log_structured(
+        "event_batch_processed",
+        event_type="inventory.reserved",
+        status="completed",
         processed_count=len(results),
-        results=results
+        batch_size=batch_size,
     )
+
+    return ProcessPaymentEventsResponse(processed_count=len(results), results=results)

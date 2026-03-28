@@ -81,8 +81,8 @@ Responsible for:
 ### Happy Path
 
 1. `order-service` stores an order and emits `order.created`.
-2. `inventory-service` processes `order.created`, reserves stock, and emits `inventory.reserved`.
-3. `payment-service` processes `inventory.reserved`, authorizes payment, and emits `payment.authorized`.
+2. `inventory-service` processes `order.created`, reserves stock, and emits `inventory.reserved` with the `amount` and `currency` needed for payment authorization.
+3. `payment-service` processes `inventory.reserved`, uses the event payload for `amount` and `currency`, authorizes payment, and emits `payment.authorized`.
 4. `shipment-service` processes `payment.authorized`, creates a shipment, and emits `shipment.created`.
 5. `workflow_state.current_step` reaches `SHIPMENT_CREATED`.
 
@@ -123,17 +123,15 @@ Each consuming service selects pending events with `FOR UPDATE SKIP LOCKED`, pro
 
 These are part of the implementation today and are important for accurate documentation:
 
-- `payment-service` reads `amount` and `currency` directly from the shared `orders` table instead of using only the event payload.
-- `workflow_state` is the most complete view of lifecycle progress; `orders.status` is initialized to `PENDING` and is not updated by downstream services.
-- `inventory.failed`, `payment.failed`, and `shipment.created` are emitted into `outbox_events`, but no downstream processor consumes them.
-- startup ordering depends on container timing because Compose currently uses `depends_on` without service health checks
+- services still share one database, but `payment-service` now uses `inventory.reserved` payload data instead of reading `amount` and `currency` from the shared `orders` table.
+- `workflow_state` is still the most complete view of lifecycle progress; `orders.status` stays `PENDING` during in-flight work and is updated to `FAILED` or `COMPLETED` when the workflow reaches a terminal outcome.
+- `inventory.failed`, `payment.failed`, and `shipment.created` are emitted into `outbox_events` for audit visibility, but they are inserted with a non-pending status because no downstream processor consumes them.
 
 ## Future Improvements
 
 Accurate future improvements for the current codebase include:
 
-- add Compose health checks and health-based startup ordering
-- make `orders.status` consistent with `workflow_state`, or reduce duplicate status storage
+- reduce duplicate status storage between `orders` and `workflow_state`, or define stricter ownership for each field
 - move from a shared outbox table to explicit per-service messaging or a broker such as Kafka or RabbitMQ
 - add explicit retry, backoff, and dead-letter handling for failed event processing
 - add metrics and tracing for service-level observability

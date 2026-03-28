@@ -1,50 +1,23 @@
 import logging
-import os
-import time
 
-import psycopg
-
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql://postgres:postgres@localhost:5432/order_db"
+from shared.db import (
+    get_connection as shared_get_connection,
 )
-DATABASE_WAIT_TIMEOUT_SECONDS = int(
-    os.getenv("DATABASE_WAIT_TIMEOUT_SECONDS", "30")
-)
-DATABASE_WAIT_INTERVAL_SECONDS = float(
-    os.getenv("DATABASE_WAIT_INTERVAL_SECONDS", "1")
+from shared.db import (
+    load_database_settings,
+    wait_for_database,
 )
 
 logger = logging.getLogger(__name__)
+DATABASE_SETTINGS = load_database_settings()
 
 
 def get_connection():
-    return psycopg.connect(DATABASE_URL)
-
-
-def wait_for_database():
-    deadline = time.monotonic() + DATABASE_WAIT_TIMEOUT_SECONDS
-    last_error = None
-
-    while time.monotonic() < deadline:
-        try:
-            with get_connection() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT 1")
-                    cur.fetchone()
-            return
-        except psycopg.OperationalError as exc:
-            last_error = exc
-            logger.info("Waiting for PostgreSQL to become ready")
-            time.sleep(DATABASE_WAIT_INTERVAL_SECONDS)
-
-    raise RuntimeError(
-        f"Database was not ready within {DATABASE_WAIT_TIMEOUT_SECONDS} seconds"
-    ) from last_error
+    return shared_get_connection(DATABASE_SETTINGS)
 
 
 def init_db():
-    wait_for_database()
+    wait_for_database(DATABASE_SETTINGS, logger)
 
     with get_connection() as conn:
         with conn.cursor() as cur:

@@ -1,13 +1,31 @@
 # Distributed Order Processing & Inventory Management System
 
+[![CI](https://github.com/Sivarohitk/Distributed-Order-Processing-Inventory-Management-System/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Sivarohitk/Distributed-Order-Processing-Inventory-Management-System/actions/workflows/ci.yml)
+![Python 3.11](https://img.shields.io/badge/python-3.11-3776AB?logo=python&logoColor=white)
+![Docker Compose](https://img.shields.io/badge/docker-compose-2496ED?logo=docker&logoColor=white)
+
 A Python microservices project that models order intake, inventory reservation, payment authorization, and shipment creation using FastAPI, PostgreSQL, and a shared transactional outbox table.
 
 This repository is intentionally small enough to review in an interview, but it still demonstrates idempotent writes, asynchronous workflow progression, shared state tracking, containerized local startup, end-to-end tests, and CI automation.
 
 Related documentation:
 - [Architecture Notes](docs/architecture.md)
+- [Roadmap And Limitations](docs/roadmap.md)
 - [Workflow Diagrams](docs/workflow-diagrams.md)
 - [GitHub Actions CI Workflow](.github/workflows/ci.yml)
+
+## Repository Highlights
+
+- End-to-end order workflow across five focused FastAPI services
+- Transactional outbox plus idempotent order intake using PostgreSQL
+- Docker Compose local environment with GitHub Actions end-to-end CI
+- Structured workflow logging, docs, and lightweight developer tooling
+
+## What This Project Demonstrates
+
+- Designing a small but realistic asynchronous business workflow
+- Applying pragmatic reliability patterns such as idempotency, health checks, and event processing
+- Balancing demo simplicity with clear documentation of current limits and future evolution
 
 ## Project Overview
 
@@ -29,6 +47,7 @@ For local-demo simplicity, all services share one PostgreSQL database. The datab
 - Transactional creation of `orders`, `workflow_state`, and `order.created` in one database transaction
 - Seeded inventory data for three demo SKUs
 - Background dispatcher polling every 5 seconds by default
+- Consistent JSON-style workflow logs with service, event type, order ID, and result fields
 - Happy-path, inventory-failure, and payment-failure end-to-end tests
 - GitHub Actions CI that boots the stack with Docker Compose and runs the test suite
 
@@ -52,7 +71,7 @@ flowchart LR
     Dispatcher -.->|"POST /events/process"| Shipment
 
     Inventory -->|"read/write stock and reservations"| DB
-    Payment -->|"read orders, write payments"| DB
+    Payment -->|"read inventory.reserved payload, write payments"| DB
     Shipment -->|"write shipments"| DB
 ```
 
@@ -72,15 +91,15 @@ flowchart LR
 2. `order-service` inserts the order, initializes `workflow_state` with `ORDER_CREATED`, and writes `order.created` to `outbox_events` in the same transaction.
 3. `dispatcher-service` calls `inventory-service` at `POST /events/process`.
 4. `inventory-service` consumes pending `order.created` events.
-   - If stock is available, it creates a reservation, sets `current_step` to `INVENTORY_RESERVED`, and emits `inventory.reserved`.
+   - If stock is available, it creates a reservation, sets `current_step` to `INVENTORY_RESERVED`, and emits `inventory.reserved` with the `amount` and `currency` that `payment-service` needs.
    - If stock is unavailable, it creates a failed reservation, sets `current_step` to `INVENTORY_REJECTED`, sets `order_status` to `FAILED`, and emits `inventory.failed`.
 5. `dispatcher-service` calls `payment-service` at `POST /events/process`.
-6. `payment-service` consumes pending `inventory.reserved` events.
+6. `payment-service` consumes pending `inventory.reserved` events and uses the event payload for `amount` and `currency`.
    - If `amount <= 500`, it creates an authorized payment, sets `current_step` to `PAYMENT_AUTHORIZED`, and emits `payment.authorized`.
    - If `amount > 500`, it creates a failed payment, sets `current_step` to `PAYMENT_FAILED`, sets `order_status` to `FAILED`, and emits `payment.failed`.
 7. `dispatcher-service` calls `shipment-service` at `POST /events/process`.
 8. `shipment-service` consumes pending `payment.authorized` events, creates a shipment, sets `current_step` to `SHIPMENT_CREATED`, sets `order_status` to `COMPLETED`, and emits `shipment.created`.
-9. In the current implementation, no downstream service consumes `inventory.failed`, `payment.failed`, or `shipment.created`, so those terminal events remain visible in `GET /outbox/pending`.
+9. In the current implementation, no downstream service consumes `inventory.failed`, `payment.failed`, or `shipment.created`, so those terminal events are stored for audit with a non-pending status and do not remain in `GET /outbox/pending`.
 
 ## Event Sequence Diagram
 
@@ -101,7 +120,7 @@ sequenceDiagram
         Dispatcher->>Inventory: POST /events/process
         Inventory->>DB: Read pending order.created
         alt Stock available
-            Inventory->>DB: Reserve stock, set INVENTORY_RESERVED, insert inventory.reserved
+            Inventory->>DB: Reserve stock, set INVENTORY_RESERVED, insert inventory.reserved with amount/currency
             Dispatcher->>Payment: POST /events/process
             Payment->>DB: Read pending inventory.reserved
             alt Amount <= 500
@@ -122,12 +141,22 @@ sequenceDiagram
 
 ```text
 .
+|- .editorconfig
+|- .env.example
+|- LICENSE
 |- README.md
+|- Makefile
 |- docker-compose.yml
+|- pyproject.toml
 |- requirements-test.txt
 |- docs/
 |  |- architecture.md
+|  |- roadmap.md
 |  `- workflow-diagrams.md
+|- scripts/
+|  |- demo.ps1
+|  |- demo.py
+|  `- demo.sh
 |- services/
 |  |- dispatcher-service/
 |  |- inventory-service/
@@ -186,6 +215,81 @@ Stop and remove the stack:
 ```bash
 docker compose down -v
 ```
+
+## Developer Workflow
+
+`docker compose` reads a local `.env` file automatically. Start by copying the example file:
+
+```bash
+cp .env.example .env
+```
+
+PowerShell:
+
+```powershell
+Copy-Item .env.example .env
+```
+
+Common commands from the repo root:
+
+```bash
+make up
+make ps
+make logs
+make rebuild
+make test
+make down
+make clean
+```
+
+Notes:
+
+- `make up` starts the stack with the current images.
+- `make rebuild` rebuilds images and starts the stack again.
+- `make test` runs `pytest tests -v`, so start the stack first with `make up` or `make rebuild`.
+- If `make` is not installed on your machine, use the equivalent `docker compose` and `pytest` commands shown in this README.
+
+## Demo Script
+
+With the stack already running, you can walk through one full happy-path order using:
+
+```bash
+bash scripts/demo.sh
+```
+
+PowerShell:
+
+```powershell
+./scripts/demo.ps1
+```
+
+The demo script creates one order, waits for the workflow to reach `SHIPMENT_CREATED`, then prints the order ID, final workflow state, and shipment record.
+
+The shell and PowerShell entry points run the demo from inside the Docker Compose network, so the command stays reliable even on machines where local proxy settings interfere with `localhost` HTTP calls.
+
+## Formatting And Linting
+
+This repository uses [`ruff`](https://docs.astral.sh/ruff/) for lightweight linting and formatting, with shared settings in [pyproject.toml](pyproject.toml).
+
+Install it once in your local Python environment:
+
+```bash
+python -m pip install ruff
+```
+
+Run the lint checks:
+
+```bash
+python -m ruff check .
+```
+
+Run the formatter on files you touched:
+
+```bash
+python -m ruff format path/to/file.py
+```
+
+If you intentionally want a broader cleanup, you can run `python -m ruff format .`.
 
 ## API Docs URLs
 
@@ -260,6 +364,12 @@ Run the test suite:
 
 ```bash
 pytest tests -v
+```
+
+Or, after the stack is already running:
+
+```bash
+make test
 ```
 
 Current test coverage in `tests/test_e2e_workflow.py` includes:

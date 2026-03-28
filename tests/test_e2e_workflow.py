@@ -3,6 +3,7 @@ import time
 import uuid
 
 import httpx
+import psycopg
 
 DISPATCHER_SERVICE_URL = os.getenv("DISPATCHER_SERVICE_URL", "http://127.0.0.1:8005")
 ORDER_SERVICE_URL = os.getenv("ORDER_SERVICE_URL", "http://127.0.0.1:8001")
@@ -10,6 +11,10 @@ INVENTORY_SERVICE_URL = os.getenv("INVENTORY_SERVICE_URL", "http://127.0.0.1:800
 PAYMENT_SERVICE_URL = os.getenv("PAYMENT_SERVICE_URL", "http://127.0.0.1:8003")
 SHIPMENT_SERVICE_URL = os.getenv("SHIPMENT_SERVICE_URL", "http://127.0.0.1:8004")
 REQUEST_TIMEOUT_SECONDS = 10.0
+TEST_DATABASE_URL = os.getenv(
+    "TEST_DATABASE_URL",
+    "postgresql://postgres:postgres@127.0.0.1:5432/order_db",
+)
 
 
 def request(method: str, url: str, **kwargs):
@@ -52,6 +57,32 @@ def get_order(order_id: str):
 
 def get_workflow(order_id: str):
     response = request("GET", f"{ORDER_SERVICE_URL}/workflows/{order_id}")
+    response.raise_for_status()
+    return response.json()
+
+
+def get_pending_outbox_events():
+    response = request("GET", f"{ORDER_SERVICE_URL}/outbox/pending")
+    response.raise_for_status()
+    return response.json()
+
+
+def process_inventory_events(batch_size: int = 10):
+    response = request(
+        "POST",
+        f"{INVENTORY_SERVICE_URL}/events/process",
+        params={"batch_size": batch_size},
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def process_payment_events(batch_size: int = 10):
+    response = request(
+        "POST",
+        f"{PAYMENT_SERVICE_URL}/events/process",
+        params={"batch_size": batch_size},
+    )
     response.raise_for_status()
     return response.json()
 
@@ -99,6 +130,26 @@ def wait_for_workflow_step(order_id: str, expected_step: str, timeout_seconds: i
     )
 
 
+def assert_no_pending_outbox_events_for_order(order_id: str):
+    pending_events = get_pending_outbox_events()
+    assert not any(
+        event["aggregate_id"] == order_id
+        for event in pending_events
+    )
+
+
+def update_order_amount_and_currency(order_id: str, amount: float, currency: str):
+    with psycopg.connect(TEST_DATABASE_URL) as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE orders
+                SET amount = %s,
+                    currency = %s
+                WHERE order_id = %s
+            """, (amount, currency, order_id))
+        conn.commit()
+
+
 def test_idempotent_order_creation_returns_the_same_order():
     idempotency_key = f"idempotency-{uuid.uuid4()}"
     customer_id = f"cust-{uuid.uuid4()}"
@@ -133,6 +184,47 @@ def test_idempotent_order_creation_returns_the_same_order():
     assert stored_order["status"] == "PENDING"
 
 
+def test_payment_service_uses_inventory_event_payload_instead_of_orders_table():
+    for _ in range(3):
+        order, workflow = create_order_with_pending_work(
+            sku="SKU-LAMP-01",
+            quantity=1,
+            amount=80.00,
+        )
+        order_id = order["order_id"]
+
+        assert workflow["current_step"] == "ORDER_CREATED"
+
+        summary = process_inventory_events(batch_size=1)
+
+        assert summary["processed_count"] in (0, 1)
+        if get_payment(order_id).status_code == 404:
+            break
+        time.sleep(0.5)
+    else:
+        raise AssertionError(
+            "Could not create an order before the background dispatcher processed payment"
+        )
+
+    update_order_amount_and_currency(order_id, 999.99, "EUR")
+
+    payment_summary = process_payment_events(batch_size=1)
+    assert payment_summary["processed_count"] in (0, 1)
+
+    dispatch_run_once()
+    workflow_after = wait_for_workflow_step(order_id, "SHIPMENT_CREATED", timeout_seconds=5)
+    assert workflow_after["order_status"] == "COMPLETED"
+
+    payment_response = get_payment(order_id)
+    assert payment_response.status_code == 200
+
+    payment = payment_response.json()
+    assert payment["amount"] == order["amount"]
+    assert payment["currency"] == order["currency"]
+    assert payment["status"] == "AUTHORIZED"
+    assert_no_pending_outbox_events_for_order(order_id)
+
+
 def test_dispatch_run_once_advances_pending_work():
     order, workflow = create_order_with_pending_work(
         sku="SKU-LAMP-01",
@@ -160,6 +252,11 @@ def test_dispatch_run_once_advances_pending_work():
     assert workflow_after["payment_status"] == "AUTHORIZED"
     assert workflow_after["shipment_status"] == "CREATED"
 
+    stored_order = get_order(order_id)
+    assert stored_order["order_id"] == order_id
+    assert stored_order["status"] == "COMPLETED"
+    assert_no_pending_outbox_events_for_order(order_id)
+
 
 def test_happy_path_order_to_shipment():
     order = create_order(sku="SKU-LAMP-01", quantity=2, amount=120.00)
@@ -176,7 +273,8 @@ def test_happy_path_order_to_shipment():
 
     stored_order = get_order(order_id)
     assert stored_order["order_id"] == order_id
-    assert stored_order["status"] == "PENDING"
+    assert stored_order["status"] == "COMPLETED"
+    assert_no_pending_outbox_events_for_order(order_id)
 
     shipment_response = get_shipment(order_id)
     assert shipment_response.status_code == 200
@@ -201,7 +299,8 @@ def test_inventory_failure_path():
 
     stored_order = get_order(order_id)
     assert stored_order["order_id"] == order_id
-    assert stored_order["status"] == "PENDING"
+    assert stored_order["status"] == "FAILED"
+    assert_no_pending_outbox_events_for_order(order_id)
 
     payment_response = get_payment(order_id)
     assert payment_response.status_code == 404
@@ -225,7 +324,8 @@ def test_payment_failure_path():
 
     stored_order = get_order(order_id)
     assert stored_order["order_id"] == order_id
-    assert stored_order["status"] == "PENDING"
+    assert stored_order["status"] == "FAILED"
+    assert_no_pending_outbox_events_for_order(order_id)
 
     payment_response = get_payment(order_id)
     assert payment_response.status_code == 200

@@ -3,30 +3,34 @@ services:
     image: postgres:16
     container_name: order-db
     environment:
-      POSTGRES_DB: order_db
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: ${POSTGRES_DB:-order_db}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
     ports:
-      - "5432:5432"
+      - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d order_db"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-order_db}"]
       interval: 5s
       timeout: 5s
       retries: 12
       start_period: 5s
 
   order-service:
-    build: ./services/order-service
+    build:
+      context: .
+      dockerfile: services/order-service/Dockerfile
     container_name: order-service
     environment:
-      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/order_db
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-order_db}
+      DATABASE_WAIT_TIMEOUT_SECONDS: ${DATABASE_WAIT_TIMEOUT_SECONDS:-30}
+      DATABASE_WAIT_INTERVAL_SECONDS: ${DATABASE_WAIT_INTERVAL_SECONDS:-1}
     depends_on:
       postgres:
         condition: service_healthy
     ports:
-      - "8001:8001"
+      - "${ORDER_SERVICE_PORT:-8001}:8001"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=2)"]
       interval: 5s
@@ -35,15 +39,19 @@ services:
       start_period: 5s
 
   inventory-service:
-    build: ./services/inventory-service
+    build:
+      context: .
+      dockerfile: services/inventory-service/Dockerfile
     container_name: inventory-service
     environment:
-      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/order_db
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-order_db}
+      DATABASE_WAIT_TIMEOUT_SECONDS: ${DATABASE_WAIT_TIMEOUT_SECONDS:-30}
+      DATABASE_WAIT_INTERVAL_SECONDS: ${DATABASE_WAIT_INTERVAL_SECONDS:-1}
     depends_on:
       postgres:
         condition: service_healthy
     ports:
-      - "8002:8002"
+      - "${INVENTORY_SERVICE_PORT:-8002}:8002"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8002/health', timeout=2)"]
       interval: 5s
@@ -52,15 +60,19 @@ services:
       start_period: 5s
 
   payment-service:
-    build: ./services/payment-service
+    build:
+      context: .
+      dockerfile: services/payment-service/Dockerfile
     container_name: payment-service
     environment:
-      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/order_db
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-order_db}
+      DATABASE_WAIT_TIMEOUT_SECONDS: ${DATABASE_WAIT_TIMEOUT_SECONDS:-30}
+      DATABASE_WAIT_INTERVAL_SECONDS: ${DATABASE_WAIT_INTERVAL_SECONDS:-1}
     depends_on:
       postgres:
         condition: service_healthy
     ports:
-      - "8003:8003"
+      - "${PAYMENT_SERVICE_PORT:-8003}:8003"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8003/health', timeout=2)"]
       interval: 5s
@@ -69,15 +81,19 @@ services:
       start_period: 5s
 
   shipment-service:
-    build: ./services/shipment-service
+    build:
+      context: .
+      dockerfile: services/shipment-service/Dockerfile
     container_name: shipment-service
     environment:
-      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/order_db
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-order_db}
+      DATABASE_WAIT_TIMEOUT_SECONDS: ${DATABASE_WAIT_TIMEOUT_SECONDS:-30}
+      DATABASE_WAIT_INTERVAL_SECONDS: ${DATABASE_WAIT_INTERVAL_SECONDS:-1}
     depends_on:
       postgres:
         condition: service_healthy
     ports:
-      - "8004:8004"
+      - "${SHIPMENT_SERVICE_PORT:-8004}:8004"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8004/health', timeout=2)"]
       interval: 5s
@@ -89,11 +105,11 @@ services:
     build: ./services/dispatcher-service
     container_name: dispatcher-service
     environment:
-      INVENTORY_SERVICE_URL: http://inventory-service:8002
-      PAYMENT_SERVICE_URL: http://payment-service:8003
-      SHIPMENT_SERVICE_URL: http://shipment-service:8004
-      POLL_INTERVAL_SECONDS: 5
-      BATCH_SIZE: 10
+      INVENTORY_SERVICE_URL: ${INVENTORY_SERVICE_URL:-http://inventory-service:8002}
+      PAYMENT_SERVICE_URL: ${PAYMENT_SERVICE_URL:-http://payment-service:8003}
+      SHIPMENT_SERVICE_URL: ${SHIPMENT_SERVICE_URL:-http://shipment-service:8004}
+      POLL_INTERVAL_SECONDS: ${POLL_INTERVAL_SECONDS:-5}
+      BATCH_SIZE: ${BATCH_SIZE:-10}
     depends_on:
       order-service:
         condition: service_healthy
@@ -104,7 +120,7 @@ services:
       shipment-service:
         condition: service_healthy
     ports:
-      - "8005:8005"
+      - "${DISPATCHER_SERVICE_PORT:-8005}:8005"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8005/health', timeout=2)"]
       interval: 5s
