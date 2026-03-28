@@ -393,14 +393,3 @@ The workflow currently:
 - Prints container logs on failure
 - Shuts the stack down with `docker compose down -v`
 
-## Resume And Interview Value
-
-This repository is a strong interview discussion piece because it shows:
-
-- Service boundaries around a business workflow instead of a single CRUD API
-- Idempotent write handling with an explicit request header
-- A transactional outbox pattern backed by SQL rather than an in-memory queue
-- Workflow-state tracking that lets you inspect process progression by order ID
-- Containerized local setup plus end-to-end tests and CI
-
-For deeper implementation notes, see [Architecture Notes](docs/architecture.md) and [Workflow Diagrams](docs/workflow-diagrams.md).
